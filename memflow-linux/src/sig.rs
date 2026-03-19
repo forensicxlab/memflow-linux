@@ -1,3 +1,5 @@
+//! Lightweight masked byte-signature support used by low-level scanners.
+
 fn str_to_byte_iter<'a>(s: &'a str) -> impl 'a + Iterator<Item = u8> {
     s.split_whitespace()
         .map(|b| b.trim_start_matches('*'))
@@ -28,6 +30,7 @@ fn str_to_deref_pos_iter<'a>(s: &'a str, off: usize) -> (usize, impl 'a + Iterat
 }
 
 #[derive(Clone)]
+/// A masked byte signature with optional dereference offsets.
 pub struct Signature {
     bytes: Vec<u8>,
     mask: Vec<u8>,
@@ -35,6 +38,7 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// Builds a signature from whitespace-separated byte patterns.
     pub fn new(s: &[&str]) -> Self {
         let mut bytes = vec![];
         let mut mask = vec![];
@@ -57,6 +61,7 @@ impl Signature {
         }
     }
 
+    /// Returns the number of bytes in the signature.
     pub fn len(&self) -> usize {
         self.bytes.len()
     }

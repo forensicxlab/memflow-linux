@@ -1,3 +1,5 @@
+//! x86_64-specific Linux kernel scanners and signature walkers.
+
 use crate::kallsyms::*;
 use crate::sig::*;
 use memflow::prelude::v1::*;
@@ -13,17 +15,19 @@ use std::ops::RangeInclusive;
 use log::*;
 
 #[derive(Clone)]
+/// Low-level kernel discovery results recovered from x86_64 bootstrap code.
 pub struct KernelInfo {
     pub cr3: Address,
     pub phys_base: Address,
     pub la57_on: bool,
     pub virt_text: Address,
     pub phys_text: Address,
-    pub kallsyms: KallsymsInfo,
+    pub kallsyms: Option<KallsymsInfo>,
     pub version: VersionRange,
 }
 
 #[derive(Clone)]
+/// Inclusive Linux kernel version range inferred from the bootstrap signature.
 pub struct VersionRange {
     major: usize,
     minor: RangeInclusive<usize>,
@@ -107,7 +111,8 @@ impl From<(usize, RangeInclusive<usize>, usize)> for VersionRange {
     }
 }
 
-fn find_kallsyms(
+/// Locates and decodes the live `kallsyms` tables for a discovered kernel.
+pub(crate) fn find_kallsyms(
     mem: &mut impl PhysicalMemory,
     cr3: Address,
     virt_text: Address,
@@ -135,14 +140,7 @@ fn find_kallsyms(
     let (kallsyms_names, token_index, token_table) =
         parse_expand_symbol(kallsyms_expand_symbol, &mut mem, &mut buf[0..size::kb(4)])?;
 
-    let kallsyms = KallsymsInfo::new(
-        kallsyms_expand_symbol,
-        kallsyms_names,
-        token_table,
-        token_index,
-        8,
-        &mut mem,
-    )?;
+    let kallsyms = KallsymsInfo::new(kallsyms_names, token_table, token_index, 8, &mut mem)?;
 
     debug!("{:#?}", kallsyms);
 
@@ -173,9 +171,17 @@ fn find_kallsyms_lookup(
             if let Ok(OpKind::Immediate32to64) = instr.try_op_kind(1) {
                 let target = Address::from(instr.immediate32to64() as u64);
                 let target_str = "+%#lx/%#lx";
-                if let Ok(read_str) = mem.read_char_array(target, target_str.len() + 1) {
-                    if read_str.starts_with(target_str) {
-                        return Ok(prev_call.unwrap());
+                if target
+                    .to_umem()
+                    .checked_add(target_str.len() as u64 + 1)
+                    .is_some()
+                {
+                    if let Ok(read_str) = mem.read_utf8_lossy(target, target_str.len() + 1) {
+                        if read_str.starts_with(target_str) {
+                            if let Some(prev_call) = prev_call {
+                                return Ok(prev_call);
+                            }
+                        }
                     }
                 }
             }
@@ -408,6 +414,7 @@ fn read_val_relat<T: memflow::prelude::Pod>(
     mem.read((off + reloff + buf_off).into()).data_part()
 }
 
+/// Scans physical memory for a likely x86_64 Linux kernel text base.
 pub fn find_kernel_base(
     mem: &mut impl PhysicalMemory,
     cr3: Address,
@@ -421,19 +428,11 @@ pub fn find_kernel_base(
         .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
 }
 
+/// Performs the generic x86_64 Linux kernel discovery fallback scan.
 pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     let metadata = mem.metadata();
 
     let mut buf = vec![0; size::mb(2)];
-
-    let page_size = size::kb(4);
-    let page_align = size::mb(2);
-    let buf_range = buf.len() * page_align / page_size;
-
-    let mut read_data = buf
-        .chunks_mut(page_size)
-        .map(|chunk| CTup2::<Address, CSliceMut<_>>(Address::INVALID, chunk.into()))
-        .collect::<Vec<_>>();
 
     // https://elixir.bootlin.com/linux/v5.9.16/source/arch/x86/kernel/head_64.S#L112
 
@@ -468,7 +467,6 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     //
     // Depending on CONFIG_AMD_MEM_ENCRYPT, either move sme_me_mask, or zero into rax
     let pat_sme_me_mask_to_rax = "48 8b 04 25 ? ? ? ?";
-    let pat_xor_rax = "48 31 c0";
 
     // Enable PAE mode and PGE with multiple operations
     let pat_pae_pge_v2 = "
@@ -493,7 +491,6 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
         0f 20 e1
         83 e1 40
     ";
-    let pat_no_config_mce = "b9 00 00 00 00";
 
     // This test was added in 4.17
     // Needs: CONFIG_X86_5LEVEL
@@ -788,17 +785,30 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
         ),
     ];
 
-    for addr in (mem::mb(0)..metadata.max_address.to_umem())
-        .step_by(buf_range)
+    let max_sig_len = sigs.iter().map(|(_, _, sig)| sig.len()).max().unwrap_or(1);
+    let scan_step = buf
+        .len()
+        .saturating_sub(max_sig_len.saturating_sub(1))
+        .max(size::kb(4));
+
+    for addr in (0..metadata.max_address.to_umem().saturating_add(1))
+        .step_by(scan_step)
         .map(Address::from)
     {
-        for (i, CTup2(paddr, buf)) in read_data.iter_mut().enumerate() {
-            *paddr = Address::from(addr + i as umem * page_align as umem).into();
-            buf.iter_mut().for_each(|i| *i = 0);
+        buf.iter_mut().for_each(|byte| *byte = 0);
+
+        let remaining = metadata
+            .max_address
+            .to_umem()
+            .saturating_sub(addr.to_umem())
+            .saturating_add(1);
+        let read_len = std::cmp::min(buf.len(), remaining as usize);
+        if read_len < max_sig_len {
+            break;
         }
 
         mem.phys_view()
-            .read_raw_list(read_data.as_mut_slice())
+            .read_raw_into(addr, &mut buf[..read_len])
             .data_part()?;
 
         trace!("read {:x}", addr);
@@ -806,13 +816,12 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
         for (addr, num, (version, config_la57, sig)) in
             sigs.iter().flat_map(|(version, la57, sig)| {
                 let sig_len = sig.len();
-                read_data.iter().flat_map(move |CTup2(addr, buf)| {
-                    buf.windows(sig_len)
-                        .enumerate()
-                        .map(move |(off, w)| (*addr + off, w))
-                        .map(move |(a, n)| (a, n, (version.clone(), *la57, sig)))
-                        .filter(|(_, w, (_, _, sig))| sig == &w)
-                })
+                buf[..read_len]
+                    .windows(sig_len)
+                    .enumerate()
+                    .map(move |(off, w)| (addr + off, w))
+                    .map(move |(a, n)| (a, n, (version.clone(), *la57, sig)))
+                    .filter(|(_, w, (_, _, sig))| sig == &w)
             })
         {
             let (cr3_off, la57_reloff, phys_base_reloff) = if config_la57 {
@@ -856,7 +865,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
                     phys_base: phys_base.into(),
                     phys_text: text_base,
                     virt_text,
-                    kallsyms,
+                    kallsyms: Some(kallsyms),
                     version,
                 });
             }

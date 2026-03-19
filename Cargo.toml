@@ -1,16 +1,12 @@
-[package]
-name = "memflow-linux"
-version = "0.2.0-beta5"
-authors = ["Aurimas Blažulionis <0x60@pm.me>"]
-edition = "2018"
+[workspace]
+resolver = "2"
 
-[dependencies]
-memflow = "0.2.0-beta7"
-log = "0.4"
-dataview = "0.1.1"
-goblin = "0.3"
-iced-x86 = "1.12"
+members = [
+    "memflow-linux",
+    "memflow-linux-defs",
+]
 
-[dev_dependencies]
-simplelog = "^0.12.0"
-clap = { version = "4", features = ["cargo"] }
+default-members = [
+    "memflow-linux",
+    "memflow-linux-defs",
+]

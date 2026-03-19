@@ -1,6 +1,9 @@
+//! Helpers for decoding the compressed in-memory Linux `kallsyms` tables.
+
 use memflow::prelude::v1::*;
 
 #[derive(Clone, Copy, Debug)]
+/// Addresses and metadata required to iterate the live kernel symbol table.
 pub struct KallsymsInfo {
     // Kallsyms has a predictable data layout.
     //
@@ -15,16 +18,13 @@ pub struct KallsymsInfo {
     relative_base: Address,
     num_syms: usize,
     names: Address,
-    markers: Address,
     token_table: Address,
     token_index: Address,
-
-    expand_symbol: Address,
 }
 
 impl KallsymsInfo {
+    /// Builds a `KallsymsInfo` descriptor from the known token/name table addresses.
     pub fn new(
-        expand_symbol: Address,
         names: Address,
         token_table: Address,
         token_index: Address,
@@ -40,29 +40,22 @@ impl KallsymsInfo {
 
         // TODO: fallback walk names, if token_index is null, and token_table
 
-        let num_markers = (num_syms + 255) >> 8;
-
-        let markers = (token_table - num_markers * 4).as_page_aligned(alignment);
-
-        //let token_table = (markers + num_markers * 4 + (alignment - 1)).as_page_aligned(alignment);
-        //let token_index = (token_table + size::kb(64) + (alignment - 1)).as_page_aligned(alignment);
-
         Ok(Self {
             offsets,
             relative_base,
             num_syms,
             names,
-            markers,
             token_table,
             token_index,
-            expand_symbol,
         })
     }
 
+    /// Returns the number of entries in the live symbol table.
     pub fn num_syms(&self) -> usize {
         self.num_syms
     }
 
+    /// Expands a compressed symbol name into the supplied scratch string.
     pub fn expand_symbol(
         &self,
         mem: &mut impl MemoryView,
@@ -76,7 +69,7 @@ impl KallsymsInfo {
         for i in 1..=len {
             let byte = mem.read::<u8>(self.names + offset + i as usize)?;
             let idx = mem.read::<u16>(self.token_index + byte as usize * 2)?;
-            let s = mem.read_char_string(self.token_table + idx as usize)?;
+            let s = mem.read_utf8_lossy(self.token_table + idx as usize, 4096)?;
 
             name.extend(s.chars().skip(if i == 1 { 1 } else { 0 }));
         }
@@ -86,16 +79,18 @@ impl KallsymsInfo {
 
     // This function is used when both CONFIG_KALLSYMS_BASE_RELATIVE and
     // CONFIG_KALLSYMS_ABSOLUTE_PERCPU are set.
+    /// Resolves the symbol address for the supplied symbol index.
     pub fn sym_address(&self, mem: &mut impl MemoryView, idx: usize) -> Result<Address> {
         let offset = mem.read::<i32>(self.offsets + idx * 4)?;
 
         if offset < 0 {
-            Ok(self.relative_base - 1 + (-offset) as usize)
+            Ok(self.relative_base - 1 + offset.unsigned_abs() as usize)
         } else {
             Ok(Address::from(offset as u64))
         }
     }
 
+    /// Returns an iterator over the live `kallsyms` entries.
     pub fn syms_iter<'a, T: MemoryView>(&'a self, mem: &'a mut T) -> KallsymsIterator<'a, T> {
         KallsymsIterator::new(self, mem)
     }
@@ -105,6 +100,7 @@ impl KallsymsInfo {
     }*/
 }
 
+/// Iterator over decompressed Linux `kallsyms` entries.
 pub struct KallsymsIterator<'a, T> {
     kallsyms: &'a KallsymsInfo,
     mem: &'a mut T,
@@ -113,6 +109,7 @@ pub struct KallsymsIterator<'a, T> {
 }
 
 impl<'a, T: MemoryView> KallsymsIterator<'a, T> {
+    /// Creates a new iterator from a cached `kallsyms` descriptor and memory view.
     pub fn new(kallsyms: &'a KallsymsInfo, mem: &'a mut T) -> Self {
         Self {
             kallsyms,
@@ -122,6 +119,7 @@ impl<'a, T: MemoryView> KallsymsIterator<'a, T> {
         }
     }
 
+    /// Reuses the supplied buffer while advancing to the next symbol.
     pub fn next_allocfree(&mut self, out_name: &mut String) -> Option<Address> {
         if self.cur_idx >= self.kallsyms.num_syms {
             return None;

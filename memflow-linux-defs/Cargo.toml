@@ -1,0 +1,25 @@
+[package]
+name = "memflow-linux-defs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82.0"
+description = "Offline Linux definitions generator for memflow-linux"
+readme = "../README.md"
+homepage = "https://memflow.io"
+license = "MIT"
+repository = "https://github.com/memflow/memflow-linux"
+keywords = ["memflow", "introspection", "memory", "linux"]
+categories = ["api-bindings", "memory-management", "os"]
+
+[dependencies]
+# To change after Merge
+# memflow = { version = "0.2.4", path = "../../memflow/memflow" }
+memflow = { git = "https://github.com/forensicxlab/memflow", branch = "main"}
+gimli = "0.31.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+clap = { version = "4", features = ["cargo"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+simplelog = "0.12"

@@ -1,0 +1,33 @@
+[package]
+name = "memflow-linux"
+version = "0.2.0"
+authors = ["Aurimas Blažulionis <0x60@pm.me>"]
+edition = "2021"
+rust-version = "1.82.0"
+description = "Linux integration of the memflow physical memory introspection framework"
+readme = "../README.md"
+homepage = "https://memflow.io"
+repository = "https://github.com/memflow/memflow-linux"
+license = "MIT"
+keywords = ["memflow", "introspection", "memory", "linux"]
+categories = ["api-bindings", "memory-management", "os"]
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+memflow = { git = "https://github.com/forensicxlab/memflow", branch = "main", features = ["plugins"] }
+#memflow = { version = "0.2.4", path = "../../memflow/memflow", features = ["plugins"] }
+log = { version = "0.4", default-features = false }
+iced-x86 = "1.21"
+memchr = "2.7"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+simplelog = "0.12"
+clap = { version = "4", features = ["cargo"] }
+
+[features]
+default = ["plugins"]
+plugins = []
