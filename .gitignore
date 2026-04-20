@@ -6,6 +6,5 @@ Cargo.lock
 *.dll
 *.dylib
 .vscode
-*.so
 .vagrant
 TODO.md
