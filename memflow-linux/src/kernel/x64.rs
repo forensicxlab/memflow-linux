@@ -4,8 +4,6 @@ use crate::kallsyms::*;
 use crate::sig::*;
 use memflow::prelude::v1::*;
 
-use std::convert::TryInto;
-
 use memflow::architecture::x86::x64;
 
 use iced_x86::*;
@@ -147,6 +145,9 @@ pub(crate) fn find_kallsyms(
     Ok(kallsyms)
 }
 
+/// Locates `kallsyms_lookup_name` by disassembling the kernel text and searching for
+/// the call that precedes a reference to the `"+%#lx/%#lx"` format string used by
+/// `__sprint_symbol`.  Returns the call target, which is `kallsyms_lookup_name`.
 fn find_kallsyms_lookup(
     mem: &mut impl MemoryView,
     buf: &[u8],
@@ -154,7 +155,7 @@ fn find_kallsyms_lookup(
 ) -> Result<Address> {
     let mut prev_call = None;
 
-    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+    let mut decoder = Decoder::new(64, buf, DecoderOptions::NONE);
 
     decoder.set_ip(virt_text.to_umem());
 
@@ -191,6 +192,11 @@ fn find_kallsyms_lookup(
     Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
 }
 
+/// Validates a candidate `kallsyms_expand_symbol` by disassembling it and looking for
+/// two consecutive `[rax + disp]` memory accesses where the second displacement equals
+/// the first or is exactly one greater — the distinctive double-read pattern of the
+/// names/token-index boundary in `kallsyms_expand_symbol`.  Returns the matched
+/// displacement (i.e., the `kallsyms_names` address) on success.
 fn is_kallsyms_expand_symbol(mem: &mut impl MemoryView, address: Address) -> Result<Address> {
     let mut buf = vec![0; size::kb(4)];
 
@@ -246,12 +252,15 @@ fn is_kallsyms_expand_symbol(mem: &mut impl MemoryView, address: Address) -> Res
     Err(ErrorOrigin::OsLayer.into())
 }
 
+/// Walks the body of `kallsyms_lookup_name` (already disassembled into `buf`) to
+/// locate the first `call` target that passes the `is_kallsyms_expand_symbol` probe.
+/// Returns `(expand_symbol_addr, kallsyms_names_addr)`.
 fn find_kallsyms_expand_symbol(
     mem: &mut impl MemoryView,
     buf: &[u8],
     kallsyms_lookup: Address,
 ) -> Result<(Address, Address)> {
-    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+    let mut decoder = Decoder::new(64, buf, DecoderOptions::NONE);
 
     decoder.set_ip(kallsyms_lookup.to_umem());
 
@@ -276,6 +285,16 @@ fn find_kallsyms_expand_symbol(
     Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
 }
 
+/// Disassembles `kallsyms_expand_symbol` to extract the three live table addresses.
+///
+/// Phase 1: The pair of `[rax + disp]` accesses with equal or consecutive displacements
+///           identifies `kallsyms_names`.
+/// Phase 2: The next `[reg + disp]` access past `kallsyms_names` (within 32 MiB) that
+///           is not the already-seen pair identifies `kallsyms_token_index`.
+/// Phase 3: The next distinct `[reg + disp]` past `kallsyms_names` identifies
+///           `kallsyms_token_table`.
+///
+/// Returns `(kallsyms_names, kallsyms_token_index, kallsyms_token_table)`.
 fn parse_expand_symbol(
     expand_symbol: Address,
     mem: &mut impl MemoryView,
@@ -283,7 +302,7 @@ fn parse_expand_symbol(
 ) -> Result<(Address, Address, Address)> {
     mem.read_raw_into(expand_symbol, buf)?;
 
-    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+    let mut decoder = Decoder::new(64, buf, DecoderOptions::NONE);
 
     decoder.set_ip(expand_symbol.to_umem());
 
@@ -400,10 +419,15 @@ fn parse_expand_symbol(
     Ok((names, token_index, token_table))
 }
 
+/// Reads a little-endian `u32` from `buf` at byte offset `buf_off`.
 fn read_val_at(buf: &[u8], buf_off: usize) -> u32 {
-    u32::from_le_bytes(buf[buf_off..(buf_off + 4)].try_into().unwrap())
+    u32::from_le_bytes(buf[buf_off..(buf_off + 4)].try_into().expect("slice is exactly 4 bytes"))
 }
 
+/// Reads a PC-relative pointer from a signature match buffer.
+///
+/// Interprets `buf[buf_off..buf_off+4]` as a signed 32-bit RIP-relative offset,
+/// adds it to `off + buf_off`, then reads a `T`-sized value from that virtual address.
 fn read_val_relat<T: memflow::prelude::Pod>(
     mem: &mut impl MemoryView,
     buf: &[u8],
@@ -411,7 +435,7 @@ fn read_val_relat<T: memflow::prelude::Pod>(
     off: Address,
 ) -> Result<T> {
     let reloff = read_val_at(buf, buf_off) as usize;
-    mem.read((off + reloff + buf_off).into()).data_part()
+    mem.read(off + reloff + buf_off).data_part()
 }
 
 /// Scans physical memory for a likely x86_64 Linux kernel text base.
@@ -429,6 +453,18 @@ pub fn find_kernel_base(
 }
 
 /// Performs the generic x86_64 Linux kernel discovery fallback scan.
+///
+/// Scans physical memory in 2 MiB windows, matching a table of version-tagged byte
+/// signatures taken from the x86_64 bootstrap stub (`arch/x86/kernel/head_64.S`).
+/// Each signature encodes the CR3 initialisation sequence for a specific kernel version
+/// range; dereference markers (`*`) in the pattern string indicate the byte offsets
+/// from which the CR3 and `phys_base` values are extracted via RIP-relative reads.
+///
+/// On a match the function:
+/// 1. Derives `phys_base`, CR3, and the physical text base.
+/// 2. Calls [`find_kernel_base`] to translate the physical text base to a virtual address.
+/// 3. Calls [`find_kallsyms`] to locate and decode the live `kallsyms` tables.
+/// 4. Returns a [`KernelInfo`] containing everything needed to introspect the kernel.
 pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     let metadata = mem.metadata();
 
@@ -712,7 +748,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
                 pat_end,
             ]),
         ),
-        // TODO: check if this actually works (patternswise)
+        // LA57 (5-level paging) variant for 5.17+: signature coverage is uncertain on some builds.
         (
             VersionRange::from((5, 17..=255)),
             true,
@@ -845,9 +881,9 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             let phys_base =
                 read_val_relat(&mut mem.phys_view(), num, phys_base_reloff, addr + 4).unwrap_or(0);
             let cr3 = phys_base + cr3_off as u64;
-            let text_base = addr.as_page_aligned(size::mb(2)); // TODO: as_page_aligned should use mem?
+            let text_base = addr.as_page_aligned(size::mb(2));
 
-            if cr3 != phys_base && cr3 < metadata.max_address.to_umem() as u64 {
+            if cr3 != phys_base && cr3 < metadata.max_address.to_umem() {
                 info!("Version range: {}", version);
 
                 info!("phys_base: {:x}", phys_base);

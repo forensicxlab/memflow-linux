@@ -50,6 +50,14 @@ pub fn read_command_line(
     Ok(nul_split_strings(&data).join(" "))
 }
 
+/// Walks the dentry and mount chain upward to collect path components in reverse order.
+///
+/// When `mnt` is null the walk follows `d_parent` links only (e.g. for kernel
+/// threads that have no mounted root).  Otherwise the walk crosses mount-point
+/// boundaries by ascending from a `struct mount` to its parent and switching
+/// the dentry to the mount-point dentry.  The optional `root` pair
+/// `(root_mnt, root_dentry)` lets the walk stop at the process filesystem root
+/// rather than continuing to the global root.
 fn read_path_components(
     mem: &mut impl MemoryView,
     mut mnt: Address,
@@ -92,7 +100,7 @@ fn read_path_components(
 
     for _ in 0..MAX_MOUNT_DEPTH {
         let mount_root = if root.is_some_and(|(root_mnt, _)| root_mnt == mnt) {
-            root.unwrap().1
+            root.expect("is_some_and guarantees Some").1
         } else {
             mem.read_addr64(mnt + offsets.vfsmount.mnt_root)?
         };

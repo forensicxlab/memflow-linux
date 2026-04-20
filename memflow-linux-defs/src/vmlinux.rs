@@ -99,6 +99,7 @@ pub(crate) fn load_vmlinux(path: &Path, data: &[u8]) -> Result<ParsedVmlinuxProf
     })
 }
 
+/// Extracts type and enum data from the kernel's embedded BTF section.
 fn load_btf_profile(
     path: &Path,
     _banner: &[u8],
@@ -126,10 +127,12 @@ fn load_btf_profile(
     })
 }
 
+/// Constructs a memflow `Error` tagged to the OS layer with the given kind and message.
 fn profile_error(kind: ErrorKind, message: impl Into<String>) -> Error {
     Error(ErrorOrigin::OsLayer, kind).log_error(message.into())
 }
 
+/// Returns a `len`-byte sub-slice of `data` starting at `offset`, or an error naming `what`.
 fn slice<'a>(data: &'a [u8], offset: usize, len: usize, what: &str) -> Result<&'a [u8]> {
     data.get(offset..offset.saturating_add(len)).ok_or_else(|| {
         profile_error(
@@ -139,20 +142,24 @@ fn slice<'a>(data: &'a [u8], offset: usize, len: usize, what: &str) -> Result<&'
     })
 }
 
+/// Reads a little-endian `u16` from `data` at `offset`.
 fn read_u16(data: &[u8], offset: usize, what: &str) -> Result<u16> {
     let bytes = slice(data, offset, 2, what)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
+/// Reads a little-endian `u32` from `data` at `offset`.
 fn read_u32(data: &[u8], offset: usize, what: &str) -> Result<u32> {
     let bytes = slice(data, offset, 4, what)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// Reads a little-endian `i32` from `data` at `offset`.
 fn read_i32(data: &[u8], offset: usize, what: &str) -> Result<i32> {
     Ok(read_u32(data, offset, what)? as i32)
 }
 
+/// Reads a little-endian `u64` from `data` at `offset`.
 fn read_u64(data: &[u8], offset: usize, what: &str) -> Result<u64> {
     let bytes = slice(data, offset, 8, what)?;
     Ok(u64::from_le_bytes([
@@ -160,6 +167,7 @@ fn read_u64(data: &[u8], offset: usize, what: &str) -> Result<u64> {
     ]))
 }
 
+/// Reads a null-terminated C string from `data` starting at `offset`.
 fn read_cstring(data: &[u8], offset: usize, what: &str) -> Result<String> {
     let tail = data.get(offset..).ok_or_else(|| {
         profile_error(
@@ -174,12 +182,14 @@ fn read_cstring(data: &[u8], offset: usize, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&tail[..end]).into_owned())
 }
 
+/// Lightweight 64-bit LE ELF reader holding section and symbol tables.
 struct ElfFile<'a> {
     data: &'a [u8],
     sections: Vec<ElfSection>,
     symbols: HashMap<String, ElfSymbol>,
 }
 
+/// Decoded ELF section header entry.
 #[derive(Clone)]
 struct ElfSection {
     name: String,
@@ -190,6 +200,7 @@ struct ElfSection {
     entsize: usize,
 }
 
+/// Decoded ELF symbol table entry.
 #[derive(Clone, Copy)]
 struct ElfSymbol {
     value: u64,
@@ -374,6 +385,7 @@ impl<'a> ElfFile<'a> {
     }
 }
 
+/// Intermediate section header fields parsed before section names are decoded.
 struct RawElfSection {
     name_off: u32,
     addr: u64,
@@ -390,6 +402,7 @@ const OPTIONAL_MAPLE_TYPES: &[&str] = &[
     "maple_metadata",
 ];
 
+/// The three DWARF DIE kinds that have names and can be looked up by `(kind, name)`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum DwarfNamedKind {
     Struct,
@@ -416,6 +429,7 @@ impl DwarfNamedKind {
     }
 }
 
+/// Stable cross-unit reference to a single DWARF DIE (unit index + unit-local offset + global `.debug_info` offset).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DwarfTypeRef {
     unit_index: usize,
@@ -423,6 +437,7 @@ struct DwarfTypeRef {
     debug_info_offset: DebugInfoOffset<usize>,
 }
 
+/// Parsed DWARF file with pre-built lookup tables for named types and DIE offsets.
 struct DwarfFile<'a> {
     dwarf: Dwarf<EndianSlice<'a, LittleEndian>>,
     units: Vec<Unit<EndianSlice<'a, LittleEndian>>>,
@@ -563,6 +578,10 @@ impl<'a> DwarfFile<'a> {
     }
 }
 
+/// Walks DWARF DIEs and accumulates normalized `RawUserType` / `RawEnum` records.
+///
+/// Types are seeded before their members are resolved so that self-referential
+/// structs (e.g. `list_head`) do not recurse infinitely.
 struct DwarfResolver<'a> {
     dwarf: &'a DwarfFile<'a>,
     user_types: HashMap<String, RawUserType>,
@@ -897,6 +916,8 @@ impl<'a> DwarfResolver<'a> {
     }
 }
 
+/// Extracts type and enum data from the kernel's DWARF debug sections as a fallback
+/// when no usable BTF is present.
 fn load_dwarf_profile(
     path: &Path,
     _data: &[u8],
@@ -924,6 +945,7 @@ fn load_dwarf_profile(
     })
 }
 
+/// Resolves maple-tree types via BTF if the kernel was built with maple-tree VMA support.
 fn ensure_optional_maple_types_btf(btf: &BtfFile, resolver: &mut BtfResolver<'_>) -> Result<()> {
     for type_name in OPTIONAL_MAPLE_TYPES {
         if let Some(type_id) = btf.maybe_named(BtfKind::Struct, type_name) {
@@ -934,6 +956,7 @@ fn ensure_optional_maple_types_btf(btf: &BtfFile, resolver: &mut BtfResolver<'_>
     Ok(())
 }
 
+/// Resolves maple-tree types via DWARF if the kernel was built with maple-tree VMA support.
 fn ensure_optional_maple_types_dwarf(
     dwarf: &DwarfFile<'_>,
     resolver: &mut DwarfResolver<'_>,
@@ -947,6 +970,7 @@ fn ensure_optional_maple_types_dwarf(
     Ok(())
 }
 
+/// Wraps a `gimli` error into a memflow `Error` with file path and operation context.
 fn dwarf_error(path: &Path, what: &str, err: gimli::Error) -> Error {
     profile_error(
         ErrorKind::Offset,
@@ -954,6 +978,8 @@ fn dwarf_error(path: &Path, what: &str, err: gimli::Error) -> Error {
     )
 }
 
+/// Returns `true` if the DIE carries `DW_AT_declaration`, meaning it is a forward
+/// declaration rather than a complete type definition.
 fn dwarf_declaration<R: Reader>(
     entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
 ) -> Result<bool> {
@@ -971,6 +997,8 @@ fn dwarf_declaration<R: Reader>(
     }
 }
 
+/// Reads the `DW_AT_name` attribute of a DIE and returns it as a UTF-8 string, or `None`
+/// if the attribute is absent.
 fn dwarf_attr_name<R: Reader>(
     dwarf: &Dwarf<R>,
     unit: &Unit<R>,
@@ -1005,6 +1033,7 @@ fn dwarf_attr_name<R: Reader>(
     ))
 }
 
+/// Reads an arbitrary DWARF attribute as a `usize`.
 fn dwarf_attr_usize<R: Reader>(
     encoding: gimli::Encoding,
     entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
@@ -1019,6 +1048,8 @@ fn dwarf_attr_usize<R: Reader>(
     dwarf_attr_value_usize(encoding, value)
 }
 
+/// Converts a DWARF `AttributeValue` to a `usize`, handling all numeric forms and
+/// single-operation `DW_FORM_exprloc` expressions.
 fn dwarf_attr_value_usize<R: Reader>(
     encoding: gimli::Encoding,
     value: Option<AttributeValue<R>>,
@@ -1046,6 +1077,8 @@ fn dwarf_attr_value_usize<R: Reader>(
     }
 }
 
+/// Evaluates a single-operation `DW_FORM_exprloc` expression and returns it as a `usize`.
+/// Used to decode `DW_AT_data_member_location` when encoded as an expression.
 fn dwarf_exprloc_usize<R: Reader>(
     encoding: gimli::Encoding,
     expr: gimli::Expression<R>,
@@ -1077,6 +1110,8 @@ fn dwarf_exprloc_usize<R: Reader>(
     Ok(Some(value))
 }
 
+/// Returns the byte offset of a `DW_TAG_member` DIE within its containing struct,
+/// preferring `DW_AT_data_bit_offset` (divided by 8) over `DW_AT_data_member_location`.
 fn dwarf_member_offset<R: Reader>(
     unit: &Unit<R>,
     entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
@@ -1095,6 +1130,7 @@ fn dwarf_member_offset<R: Reader>(
     .unwrap_or(0))
 }
 
+/// Reads the `DW_AT_const_value` attribute of a `DW_TAG_enumerator` DIE as an `i64`.
 fn dwarf_const_i64<R: Reader>(
     entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
 ) -> Result<Option<i64>> {
@@ -1120,6 +1156,8 @@ fn dwarf_const_i64<R: Reader>(
     }
 }
 
+/// Returns the element count of a `DW_TAG_subrange_type` DIE, using `DW_AT_count`
+/// when present and falling back to `DW_AT_upper_bound + 1`.
 fn dwarf_subrange_count<R: Reader>(
     encoding: gimli::Encoding,
     entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
@@ -1133,19 +1171,23 @@ fn dwarf_subrange_count<R: Reader>(
     Ok(None)
 }
 
+/// Parsed `.BTF` section with a flat type list and a `(kind, name)` lookup index.
 struct BtfFile {
     types: Vec<BtfType>,
     named_types: HashMap<(BtfKind, String), u32>,
 }
 
+/// A single decoded BTF type record (1-based ID = index + 1).
 #[derive(Clone)]
 struct BtfType {
     kind: BtfKind,
     name: String,
+    /// `size` for composite types; `type` (referent type ID) for pointer/typedef/etc.
     size_or_type: u32,
     data: BtfTypeData,
 }
 
+/// Kind-specific payload decoded from a BTF type record.
 #[derive(Clone)]
 enum BtfTypeData {
     None,
@@ -1163,14 +1205,18 @@ enum BtfTypeData {
     },
 }
 
+/// Decoded BTF struct/union member.
 #[derive(Clone)]
 struct BtfMember {
     name: String,
     type_id: u32,
+    /// Bit offset within the containing struct (not byte offset).
     bit_offset: u32,
+    /// `Some(n)` for bitfields where `n` is the field width in bits.
     bitfield_size: Option<u8>,
 }
 
+/// BTF type kind discriminant, corresponding to the `BTF_KIND_*` constants.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum BtfKind {
     Int,
@@ -1441,6 +1487,10 @@ impl BtfFile {
     }
 }
 
+/// Walks BTF type records and accumulates normalized `RawUserType` / `RawEnum` records.
+///
+/// Types are seeded before their members are resolved so that self-referential
+/// structs (e.g. `list_head`) do not recurse infinitely.
 struct BtfResolver<'a> {
     btf: &'a BtfFile,
     user_types: HashMap<String, RawUserType>,

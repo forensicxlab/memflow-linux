@@ -3,7 +3,7 @@
 This workspace provides Linux support for the [memflow](https://github.com/memflow/memflow) memory introspection framework.
 It is designed for introspection of Linux memory through a normal memflow connector and can be used either through the memflow plugin system or as a Rust dependency.
 
-Given the diversity of Linux kernels, memflow-linux requires the corresponding `vmlinux` deggubing symbols associated to the target.
+Given the diversity of Linux kernels, memflow-linux requires the corresponding `vmlinux` debugging symbols associated to the target.
 
 ## Workspace layout
 
@@ -32,7 +32,7 @@ The typical workflow is:
 - VMA walking through maple trees on modern kernels and `mm->mmap` on older kernels
 - userland module enumeration from ELF-backed file mappings
 - kernel module enumeration
-- kernel export enumeration from live `kallsyms`
+- vmlinux export enumeration from live `kallsyms`
 
 ## Building
 
@@ -113,6 +113,7 @@ Notes:
 - `kernel_hint` is the physical kernel text base and is expected to be 2 MiB aligned.
 - The generic fallback is enabled by default and is useful as a recovery path, but it can be slow on cold scans.
 - After one successful run, later runs against the same image should usually bootstrap faster because the cached hint is validated before the slower scan paths are attempted.
+- Kernel module enumeration is supported, but kernel-module export/section enumeration is not.
 
 ## Bundled examples
 

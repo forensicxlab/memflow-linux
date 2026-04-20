@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{crate_authors, crate_version, Arg, ArgAction, Command};
 use log::Level;
@@ -53,7 +53,7 @@ fn main() {
     println!("{}", output.display());
 }
 
-fn default_output_path(vmlinux: &PathBuf) -> PathBuf {
+fn default_output_path(vmlinux: &Path) -> PathBuf {
     let file_name = vmlinux
         .file_name()
         .and_then(|name| name.to_str())

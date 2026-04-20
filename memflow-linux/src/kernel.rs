@@ -34,6 +34,8 @@ const KERNEL_SCAN_CHUNK_SIZE: usize = size::mb(64);
 const BANNER_SCAN_PREFIX_LEN: usize = 96;
 const SWAPPER_COMM: &[u8] = b"swapper/0\0";
 
+/// Reads `MEMFLOW_LINUX_GENERIC_FALLBACK` to determine the default scan policy.
+/// Falls back to `true` (enabled) when the variable is absent or unrecognised.
 fn default_generic_fallback() -> bool {
     match env::var("MEMFLOW_LINUX_GENERIC_FALLBACK") {
         Ok(value) => parse_boolish_flag(&value).unwrap_or(true),
@@ -41,6 +43,8 @@ fn default_generic_fallback() -> bool {
     }
 }
 
+/// Parses a common boolean-ish string (`1`/`on`/`true`/`yes`/`enable[d]` or their
+/// negations) into `Some(bool)`, returning `None` for unrecognised values.
 fn parse_boolish_flag(value: &str) -> Option<bool> {
     let value = value.trim();
     if value.is_empty() {
@@ -85,6 +89,7 @@ pub struct LinuxKernelInfo {
     pub banner: ReprCString,
 }
 
+/// Parsed kernel module entry used internally before converting to `ModuleInfo`.
 #[derive(Clone, Debug)]
 struct LinuxKernelModuleEntry {
     address: Address,
@@ -409,13 +414,13 @@ where
                 CachedPhysicalMemory::builder(connector)
                     .arch(arch)
                     .build()
-                    .unwrap()
+                    .expect("default page cache build cannot fail")
             }),
             build_vat_cache: Box::new(|vat, arch| {
                 CachedVirtualTranslate::builder(vat)
                     .arch(arch)
                     .build()
-                    .unwrap()
+                    .expect("default VAT cache build cannot fail")
             }),
         }
     }
@@ -428,6 +433,10 @@ impl<T: PhysicalMemory + Clone> LinuxKernel<T, DirectTranslate> {
     }
 }
 
+/// Builds the ordered list of defs file paths to try during bootstrap.
+///
+/// Priority: explicit `--profile` arg > `MEMFLOW_LINUX_PROFILE` env var >
+/// files adjacent to the image path hint matching known naming patterns.
 fn resolve_profile_candidates(
     explicit_profile: Option<&Path>,
     image_path_hint: Option<&Path>,
@@ -478,6 +487,7 @@ fn resolve_profile_candidates(
     }
 }
 
+/// Returns all matching defs files found in `dir`, sorted for deterministic ordering.
 fn read_profile_candidates(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = fs::read_dir(dir).map_err(|err| {
         Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir)
@@ -496,6 +506,8 @@ fn read_profile_candidates(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Returns `true` if the file name matches the accepted defs naming patterns
+/// (`vmlinux.toml`, `linux.toml`, `vmlinux-*.toml`, `linux-defs*.toml`).
 fn looks_like_profile_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -507,12 +519,14 @@ fn looks_like_profile_path(path: &Path) -> bool {
         || (name.starts_with("linux-defs") && name.ends_with(".toml"))
 }
 
+/// Returns `true` for dot-files, which are excluded from auto-discovery.
 fn is_hidden_profile(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with('.'))
 }
 
+/// Sorts and deduplicates a path list in-place.
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.sort();
     paths.dedup();
@@ -582,10 +596,11 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
         self.virt_mem.into_inner()
     }
 
-    fn process_reader<'a>(
-        &'a mut self,
+    /// Builds a short-lived virtual memory view for a single process page table.
+    fn process_reader(
+        &mut self,
         dtb: Address,
-    ) -> VirtualDma<Fwd<&'a mut T>, Fwd<&'a mut V>, X86VirtualTranslate> {
+    ) -> VirtualDma<Fwd<&mut T>, Fwd<&mut V>, X86VirtualTranslate> {
         let (phys_mem, vat) = self.virt_mem.mem_vat_pair();
         VirtualDma::with_vat(
             phys_mem.forward_mut(),
@@ -595,6 +610,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
         )
     }
 
+    /// Returns a synthetic `ModuleInfo` entry representing the kernel image itself.
     fn kernel_module_info(&self) -> ModuleInfo {
         ModuleInfo {
             address: self.info.os_info.base,
@@ -607,6 +623,10 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
         }
     }
 
+/// Lazily discovers and caches the live `kallsyms` tables.
+///
+/// The scanner may not locate `kallsyms` during the initial bootstrap scan,
+/// so this defers the more expensive full discovery until it is first needed.
     fn ensure_kallsyms(&mut self) -> Result<&crate::kallsyms::KallsymsInfo> {
         if self.scanner.kallsyms.is_none() {
             info!(
@@ -625,9 +645,10 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
             .expect("kallsyms must be loaded"))
     }
 
+    /// Fills in `os_info.size` the first time it is needed by scanning `kallsyms`.
     fn ensure_kernel_size(&mut self) -> Result<()> {
         if self.info.os_info.size == 0 {
-            let kallsyms = self.ensure_kallsyms()?.clone();
+            let kallsyms = *self.ensure_kallsyms()?;
             self.info.os_info.size =
                 approximate_kernel_size(self.info.os_info.base, &kallsyms, &mut self.virt_mem);
         }
@@ -635,6 +656,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
         Ok(())
     }
 
+    /// Reads `exit_state` and `exit_code` from a `task_struct` and returns the process state.
     fn process_state(&mut self, task: Address) -> ProcessState {
         let task_offsets = self.profile.offsets.task;
         let _state = self
@@ -657,6 +679,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
         }
     }
 
+    /// Returns the process architecture by comparing `binfmt` to the known ELF format addresses.
     fn process_arch(&self, binfmt: Address) -> ArchitectureIdent {
         let compat_elf = self
             .profile
@@ -666,14 +689,20 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxKernel<T, V> {
         process_arch_from_binfmt(binfmt, compat_elf)
     }
 
+    /// Returns a cached slice of kernel modules, collecting them on first call.
     fn kernel_module_cache(&mut self) -> Result<&Vec<LinuxKernelModuleEntry>> {
         if self.cached_modules.is_none() {
             self.cached_modules = Some(self.collect_kernel_modules()?);
         }
 
-        Ok(self.cached_modules.as_ref().unwrap())
+        Ok(self.cached_modules.as_ref().expect("populated above"))
     }
 
+    /// Walks the `modules` list from `struct module.list` and collects all live entries.
+    ///
+    /// Entries in state `MODULE_STATE_UNFORMED` are skipped.  The base address
+    /// and size are derived by scanning the `module_memory` array for the
+    /// lowest base and the highest end across all memory regions.
     fn collect_kernel_modules(&mut self) -> Result<Vec<LinuxKernelModuleEntry>> {
         let Some(modules_head) = self.profile.symbols.modules else {
             info!("linux kernel modules: profile does not expose the global modules list");
@@ -1005,12 +1034,11 @@ impl<T: 'static + PhysicalMemory + Clone, V: 'static + VirtualTranslate2 + Clone
                 .read::<u32>(task + self.profile.offsets.task.tgid)?;
             let next = self.virt_mem.read_addr(entry)?;
 
-            if pid == tgid && pid != 0 && !callback.call(task) {
-                count += 1;
-                break;
-            }
             if pid == tgid && pid != 0 {
                 count += 1;
+                if !callback.call(task) {
+                    break;
+                }
             }
 
             if next.is_null() || next == list_head || next == entry {
@@ -1101,10 +1129,20 @@ impl<T: 'static + PhysicalMemory + Clone, V: 'static + VirtualTranslate2 + Clone
         mut callback: ExportCallback,
     ) -> Result<()> {
         if info.address != self.info.os_info.base {
+            if self
+                .kernel_module_cache()?
+                .iter()
+                .any(|module| module.address == info.address)
+            {
+                return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotImplemented).log_error(
+                    "kernel module export enumeration is not implemented; only vmlinux exports are exposed via live kallsyms",
+                ));
+            }
+
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::ModuleNotFound));
         }
 
-        let kallsyms = self.ensure_kallsyms()?.clone();
+        let kallsyms = *self.ensure_kallsyms()?;
 
         for (address, name) in kallsyms.syms_iter(&mut self.virt_mem) {
             let export = ExportInfo {
@@ -1123,10 +1161,21 @@ impl<T: 'static + PhysicalMemory + Clone, V: 'static + VirtualTranslate2 + Clone
 
     fn module_section_list_callback(
         &mut self,
-        _info: &ModuleInfo,
+        info: &ModuleInfo,
         _callback: SectionCallback,
     ) -> Result<()> {
-        Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotImplemented))
+        if info.address == self.info.os_info.base
+            || self
+                .kernel_module_cache()?
+                .iter()
+                .any(|module| module.address == info.address)
+        {
+            Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotImplemented).log_error(
+                "kernel section enumeration is not implemented for Linux modules",
+            ))
+        } else {
+            Err(Error(ErrorOrigin::OsLayer, ErrorKind::ModuleNotFound))
+        }
     }
 }
 
@@ -1635,7 +1684,7 @@ fn validate_kernel_translation(
 
     virt_mem
         .read_raw(banner_addr, expected.len().min(256))
-        .map(|actual| actual == &expected[..expected.len().min(256)])
+        .map(|actual| actual == expected[..expected.len().min(256)])
         .unwrap_or(false)
 }
 

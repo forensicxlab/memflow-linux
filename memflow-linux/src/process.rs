@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use log::{debug, info};
 use memflow::architecture::x86::{x64 as arch_x64, X86VirtualTranslate};
-use memflow::cglue::{ForwardMut, Fwd};
+use memflow::cglue::Fwd;
 use memflow::mem::virt_translate::*;
 use memflow::prelude::v1::*;
 
@@ -18,12 +18,27 @@ use crate::util::{nul_split_strings, read_path, read_string_range, MAX_ENVIRONME
 const MAPLE_NODE_MASK: u64 = 0xff;
 const MAPLE_INTERNAL_NODE: u64 = 0x04;
 const MAPLE_ROOT_NODE: u64 = 0x02;
+const MAPLE_DENSE_SLOTS: usize = 31;
 const MAX_MAPLE_DEPTH: usize = 64;
 const MAX_VMA_ITER: usize = 1_048_576;
+const MAX_MODULE_MERGE_GAP: u64 = size::mb(4) as u64;
 const VM_READ: u64 = 0x1;
 const VM_WRITE: u64 = 0x2;
 const VM_EXEC: u64 = 0x4;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// Converts Linux `vm_flags` into a memflow `PageType`.
+fn linux_vma_page_type(flags: u64) -> PageType {
+    let page_type = if flags & VM_WRITE != 0 {
+        PageType::empty().write(true)
+    } else if flags & VM_READ != 0 {
+        PageType::empty().write(false)
+    } else {
+        PageType::UNKNOWN
+    };
+
+    page_type.noexec(flags & VM_EXEC == 0)
+}
 
 #[derive(Clone, Debug)]
 /// Linux-specific process metadata derived from `task_struct` and `mm_struct`.
@@ -44,27 +59,48 @@ pub struct LinuxProcessInfo {
     pub env_end: Address,
 }
 
+/// Raw VMA entry read from the kernel before it is converted to a module or memory range.
 #[derive(Clone, Debug)]
 struct LinuxVmaInfo {
     vma: Address,
     start: Address,
     end: Address,
     flags: u64,
+    /// Pointer to the backing `struct file`, or null for anonymous VMAs.
     file: Address,
     path: ReprCString,
     name: ReprCString,
 }
 
+/// Fully resolved user-space ELF module entry.
 #[derive(Clone, Debug)]
 struct LinuxModuleEntry {
     address: Address,
     base: Address,
     size: umem,
+    /// Backing `struct file` pointer used to match VMAs to the same module.
     file: Address,
     path: ReprCString,
     name: ReprCString,
 }
 
+/// Intermediate record used while aggregating adjacent VMAs into a single module.
+///
+/// Multiple VMAs backed by the same `struct file` (e.g. text, data, BSS) are
+/// merged into one `LinuxModuleEntry` after all seeds are collected.
+#[derive(Clone, Debug)]
+struct LinuxModuleSeed {
+    start: Address,
+    end: Address,
+    file: Address,
+    path: ReprCString,
+    name: ReprCString,
+    /// Whether the page at `start` contains an ELF magic header (used to pick
+    /// the canonical base address of the module).
+    has_elf_header: bool,
+}
+
+/// Maple-tree node type encoded in the low bits of an entry pointer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MapleType {
     Dense = 0,
@@ -201,6 +237,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         Ok(buf)
     }
 
+    /// Extracts the basename from a full module path (last `/` or `\` component).
     fn module_name(path: &str) -> ReprCString {
         path.rsplit(&['/', '\\'][..])
             .next()
@@ -210,13 +247,11 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
     }
 
     fn vm_flags_to_page_type(flags: u64) -> Option<PageType> {
-        (flags & VM_READ != 0).then_some(
-            PageType::empty()
-                .write(flags & VM_WRITE != 0)
-                .noexec(flags & VM_EXEC == 0),
-        )
+        Some(linux_vma_page_type(flags))
     }
 
+    /// Constructs a synthetic module entry from the raw `start_code`/`end_code` range
+    /// when no ELF-backed module can be found (e.g. statically linked binaries).
     fn module_fallback(&self) -> Option<ModuleInfo> {
         if self.proc_info.start_code.is_null()
             || self.proc_info.end_code <= self.proc_info.start_code
@@ -240,11 +275,16 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         })
     }
 
+    /// Returns the primary (executable) module for this process.
+    ///
+    /// Tries to match by `exe_file` pointer first, then by `start_code` falling
+    /// inside a module range, then takes the first module, and finally falls
+    /// back to the synthetic `start_code`/`end_code` entry.
     fn primary_module_info(&mut self) -> Option<ModuleInfo> {
         let exe_file = self.proc_info.exe_file;
         let start_code = self.proc_info.start_code;
 
-        if let Ok(modules) = self.module_cache().map(Clone::clone) {
+        if let Ok(modules) = self.module_cache().cloned() {
             if let Some(module) = modules
                 .iter()
                 .find(|module| !exe_file.is_null() && module.file == exe_file)
@@ -269,6 +309,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         self.module_fallback()
     }
 
+    /// Returns the `struct path` address for the process filesystem root, if available.
     fn root_path(&self) -> Option<Address> {
         self.proc_info
             .fs
@@ -281,7 +322,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
             self.cached_vmas = Some(self.collect_vmas()?);
         }
 
-        Ok(self.cached_vmas.as_ref().unwrap())
+        Ok(self.cached_vmas.as_ref().expect("populated above"))
     }
 
     fn module_cache(&mut self) -> Result<&Vec<LinuxModuleEntry>> {
@@ -289,7 +330,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
             self.cached_modules = Some(self.collect_modules()?);
         }
 
-        Ok(self.cached_modules.as_ref().unwrap())
+        Ok(self.cached_modules.as_ref().expect("populated above"))
     }
 
     fn collect_vmas(&mut self) -> Result<Vec<LinuxVmaInfo>> {
@@ -385,8 +426,12 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         Ok(out)
     }
 
+    /// Iterates file-backed VMAs to build the list of loaded ELF modules.
+    ///
+    /// Each file-backed VMA becomes a `LinuxModuleSeed`; seeds sharing the same
+    /// `file` pointer are later merged by [`aggregate_module_seeds`].
     fn collect_modules(&mut self) -> Result<Vec<LinuxModuleEntry>> {
-        let mut modules: Vec<LinuxModuleEntry> = Vec::new();
+        let mut seeds = Vec::new();
 
         for vma in self
             .vma_cache()?
@@ -399,26 +444,19 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
                 continue;
             }
 
-            if !self.is_elf_image(vma.start) {
-                continue;
-            }
-
-            if let Some(last) = modules.last_mut() {
-                let last_end = last.base.to_umem().saturating_add(last.size);
-                if last.file == vma.file && last_end == vma.start.to_umem() {
-                    last.size = last.size.saturating_add(size);
-                    continue;
-                }
-            }
-
-            let entry = LinuxModuleEntry {
-                address: vma.start,
-                base: vma.start,
-                size,
+            seeds.push(LinuxModuleSeed {
+                start: vma.start,
+                end: vma.end,
                 file: vma.file,
                 path: vma.path.clone(),
                 name: vma.name.clone(),
-            };
+                has_elf_header: self.is_elf_image(vma.start),
+            });
+        }
+
+        let modules = aggregate_module_seeds(seeds);
+
+        for entry in &modules {
             debug!(
                 "linux process {} module: {} base={} size={:#x}",
                 self.proc_info.base_info.pid,
@@ -426,7 +464,6 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
                 entry.base,
                 entry.size
             );
-            modules.push(entry);
         }
 
         info!(
@@ -437,6 +474,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         Ok(modules)
     }
 
+    /// Returns `true` if the four bytes at `base` match the ELF magic header `\x7fELF`.
     fn is_elf_image(&mut self, base: Address) -> bool {
         let mut magic = [0_u8; 4];
         self.virt_mem
@@ -461,7 +499,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         if let Some(node_type) = Self::maple_type(entry) {
             let node = Address::from(entry & !MAPLE_NODE_MASK);
             match node_type {
-                MapleType::Dense => Ok(()),
+                MapleType::Dense => self.walk_maple_dense(node, min, max, depth, out),
                 MapleType::Leaf64 | MapleType::Range64 => {
                     self.walk_maple_range64(node, node_type, min, max, depth, out)
                 }
@@ -470,6 +508,31 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         } else {
             self.push_vma_entry(Address::from(entry), out)
         }
+    }
+
+    /// Walks a dense maple node whose pivots are implied by the parent range.
+    fn walk_maple_dense(
+        &mut self,
+        node: Address,
+        min: u64,
+        max: u64,
+        depth: usize,
+        out: &mut Vec<LinuxVmaInfo>,
+    ) -> Result<()> {
+        let span = max.saturating_sub(min);
+        let slots = std::cmp::min(MAPLE_DENSE_SLOTS, span.saturating_add(1) as usize);
+
+        for index in 0..slots {
+            let slot = self.read_maple_u64(node + index * size_of::<u64>())?;
+            if slot == 0 {
+                continue;
+            }
+
+            let slot_min = min.saturating_add(index as u64);
+            self.walk_maple_entry(slot, slot_min, slot_min, depth + 1, out)?;
+        }
+
+        Ok(())
     }
 
     /// Walks a `maple_range_64` node.
@@ -552,6 +615,10 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         Ok(())
     }
 
+    /// Determines the last valid slot index in a `maple_range_64` node.
+    ///
+    /// Uses `meta_end` from the node header when the last pivot is zero
+    /// (meaning only part of the slot array is populated).
     fn range64_data_end(
         &mut self,
         node: Address,
@@ -576,6 +643,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         Ok(data_end.min(offsets.slot_count.saturating_sub(1)))
     }
 
+    /// Reads a VMA at the given address and appends it to `out`, skipping null or low entries.
     fn push_vma_entry(&mut self, vma: Address, out: &mut Vec<LinuxVmaInfo>) -> Result<()> {
         if vma.is_null() || vma.to_umem() < size::kb(4) as u64 {
             return Ok(());
@@ -588,6 +656,8 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         Ok(())
     }
 
+    /// Reads one `vm_area_struct` and resolves the backing file path.
+    /// Returns `None` for zero-sized or otherwise invalid VMAs.
     fn read_vma_info(&mut self, vma: Address) -> Result<Option<LinuxVmaInfo>> {
         let offsets = self.profile.offsets.vma;
         let start = Address::from(self.virt_mem.read::<u64>(vma + offsets.vm_start)?);
@@ -631,6 +701,7 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         }))
     }
 
+    /// Reads a 64-bit value from the given virtual address (used for all maple tree fields).
     fn read_maple_u64(&mut self, addr: Address) -> Result<u64> {
         Ok(self.virt_mem.read::<u64>(addr)?)
     }
@@ -650,6 +721,8 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> LinuxProcess<T, V> {
         }
     }
 
+    /// Converts a sorted VMA slice into memflow memory ranges, merging adjacent VMAs
+    /// that share the same `PageType` and are within `gap_size` of each other.
     fn emit_vma_ranges(
         vmas: &[LinuxVmaInfo],
         gap_size: imem,
@@ -809,11 +882,22 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> Process for LinuxProcess<T, V> {
         end: Address,
         out: MemoryRangeCallback,
     ) {
-        let mm_is_null = self.proc_info.mm.is_null();
-        match self.vma_cache().map(Clone::clone) {
+        match self.vma_cache().cloned() {
             Ok(vmas) if !vmas.is_empty() => Self::emit_vma_ranges(&vmas, gap_size, start, end, out),
-            _ if mm_is_null => self.virt_mem.virt_page_map_range(gap_size, start, end, out),
-            _ => {}
+            Ok(_) => {
+                debug!(
+                    "linux process {}: VMA walk returned no ranges, falling back to page-table walk",
+                    self.proc_info.base_info.pid
+                );
+                self.virt_mem.virt_page_map_range(gap_size, start, end, out);
+            }
+            Err(err) => {
+                debug!(
+                    "linux process {}: VMA walk failed, falling back to page-table walk: {:?}",
+                    self.proc_info.base_info.pid, err
+                );
+                self.virt_mem.virt_page_map_range(gap_size, start, end, out);
+            }
         }
     }
 
@@ -823,6 +907,9 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> Process for LinuxProcess<T, V> {
         callback: EnvVarCallback,
     ) -> Result<()> {
         if target_arch.is_some() && target_arch != Some(&self.proc_info.base_info.proc_arch) {
+            return Ok(());
+        }
+        if self.proc_info.env_start.is_null() {
             return Ok(());
         }
 
@@ -872,4 +959,75 @@ impl<T: PhysicalMemory, V: VirtualTranslate2> Process for LinuxProcess<T, V> {
 
         Ok(())
     }
+}
+
+/// Merges adjacent or overlapping VMA seeds that share a `file` pointer into one module entry.
+///
+/// Seeds are sorted by `(file, start)`.  Two seeds merge if they share the same
+/// file pointer and the new seed starts within `MAX_MODULE_MERGE_GAP` bytes after the
+/// current module ends.  Only seeds with an ELF header create new entries; non-header
+/// seeds are dropped unless they can be appended to an existing entry.
+fn aggregate_module_seeds(mut seeds: Vec<LinuxModuleSeed>) -> Vec<LinuxModuleEntry> {
+    seeds.sort_by_key(|seed| (seed.file.to_umem(), seed.start.to_umem(), seed.end.to_umem()));
+
+    let mut modules = Vec::new();
+
+    for seed in seeds {
+        let size = seed.end.to_umem().saturating_sub(seed.start.to_umem());
+        if size == 0 {
+            continue;
+        }
+
+        let merge_idx = modules.iter().rposition(|module: &LinuxModuleEntry| {
+            if module.file != seed.file {
+                return false;
+            }
+
+            let module_end = module.base.to_umem().saturating_add(module.size);
+            seed.start.to_umem() <= module_end.saturating_add(MAX_MODULE_MERGE_GAP)
+        });
+
+        if let Some(index) = merge_idx {
+            let module = &mut modules[index];
+            let module_start = module.base.to_umem().min(seed.start.to_umem());
+            let module_end = module
+                .base
+                .to_umem()
+                .saturating_add(module.size)
+                .max(seed.end.to_umem());
+
+            module.address = Address::from(module_start);
+            module.base = Address::from(module_start);
+            module.size = module_end.saturating_sub(module_start);
+
+            if module.path.as_ref().is_empty() && !seed.path.as_ref().is_empty() {
+                module.path = seed.path.clone();
+            }
+            if module.name.as_ref().is_empty() && !seed.name.as_ref().is_empty() {
+                module.name = seed.name.clone();
+            }
+
+            if seed.has_elf_header {
+                module.address = module.base;
+            }
+
+            continue;
+        }
+
+        if !seed.has_elf_header {
+            continue;
+        }
+
+        modules.push(LinuxModuleEntry {
+            address: seed.start,
+            base: seed.start,
+            size,
+            file: seed.file,
+            path: seed.path,
+            name: seed.name,
+        });
+    }
+
+    modules.sort_by_key(|module| module.base.to_umem());
+    modules
 }

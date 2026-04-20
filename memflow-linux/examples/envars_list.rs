@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     let process_name = matches
         .get_one::<String>("process")
         .map(String::as_str)
-        .ok_or_else(|| Error(ErrorOrigin::OsLayer, ErrorKind::RequiredArgNotFound))?;
+        .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::RequiredArgNotFound))?;
     let envar_name = matches
         .get_one::<String>("envar")
         .map(String::as_str)

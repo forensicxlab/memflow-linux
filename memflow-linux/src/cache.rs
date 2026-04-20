@@ -208,6 +208,7 @@ impl KernelHintCache {
     }
 }
 
+/// One validated kernel-hint cache record stored on disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CacheEntry {
     version: u32,
@@ -217,12 +218,14 @@ struct CacheEntry {
     updated_unix_secs: u64,
 }
 
+/// Parsed representation of the `MEMFLOW_LINUX_KERNEL_HINT_CACHE` env value.
 enum CacheOptionValue {
     Disabled,
     Default,
     Dir(PathBuf),
 }
 
+/// Parses the value of `MEMFLOW_LINUX_KERNEL_HINT_CACHE` into a typed option.
 fn parse_cache_option(value: &str) -> CacheOptionValue {
     if value.is_empty()
         || value.eq_ignore_ascii_case("1")
@@ -242,6 +245,7 @@ fn parse_cache_option(value: &str) -> CacheOptionValue {
     }
 }
 
+/// Serialises a `CacheEntry` to a simple key = value text format.
 fn format_cache_entry(entry: &CacheEntry) -> String {
     format!(
         "version = {}\nmemory_fingerprint = \"0x{:016x}\"\ndefs_fingerprint = \"0x{:016x}\"\nkernel_hint = \"0x{:x}\"\nupdated_unix_secs = {}\n",
@@ -253,6 +257,7 @@ fn format_cache_entry(entry: &CacheEntry) -> String {
     )
 }
 
+/// Parses a `CacheEntry` from the key = value text written by [`format_cache_entry`].
 fn parse_cache_entry(content: &str) -> Result<CacheEntry> {
     let mut version = None;
     let mut memory_fingerprint = None;
@@ -307,14 +312,15 @@ fn parse_cache_entry(content: &str) -> Result<CacheEntry> {
     }
 }
 
+/// Parses a decimal or `0x`-prefixed hex string into a `u64`, returning `None` on failure.
 fn parse_hex_u64(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     let digits = trimmed.trim_start_matches("0x").trim_start_matches("0X");
-    let radix = if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        16
-    } else if digits
-        .bytes()
-        .any(|byte| matches!(byte, b'a'..=b'f' | b'A'..=b'F'))
+    let radix = if trimmed.starts_with("0x")
+        || trimmed.starts_with("0X")
+        || digits
+            .bytes()
+            .any(|byte| matches!(byte, b'a'..=b'f' | b'A'..=b'F'))
     {
         16
     } else {
@@ -324,6 +330,12 @@ fn parse_hex_u64(value: &str) -> Option<u64> {
     u64::from_str_radix(digits, radix).ok()
 }
 
+/// Hashes physical memory metadata and sparse page samples into a stable fingerprint.
+///
+/// The fingerprint is used as the cache key.  It samples up to eight evenly
+/// spaced 4 KiB pages across the full physical address space so that images
+/// with the same size but different content produce different keys, while being
+/// fast enough to compute on every startup.
 fn compute_memory_fingerprint(mem: &mut impl PhysicalMemory) -> u64 {
     let metadata = mem.metadata();
     let total = metadata.max_address.to_umem().saturating_add(1);
@@ -363,6 +375,10 @@ fn compute_memory_fingerprint(mem: &mut impl PhysicalMemory) -> u64 {
     hash.finish()
 }
 
+/// Hashes the key symbol addresses and banner from a loaded profile.
+///
+/// Stored alongside the memory fingerprint so a cache entry is invalidated if
+/// the defs file is replaced with one for a different kernel build.
 fn compute_defs_fingerprint(profile: &LinuxProfile) -> u64 {
     let mut hash = Fnv64::new();
     hash.write(profile.source.as_os_str().as_encoded_bytes());
@@ -373,6 +389,10 @@ fn compute_defs_fingerprint(profile: &LinuxProfile) -> u64 {
     hash.finish()
 }
 
+/// Returns up to eight page-aligned physical offsets spread across `total` bytes.
+///
+/// Offsets are at 0, 4K, ⅛, ¼, ½, ¾, ⅞ and the last page, de-duplicated and
+/// sorted, to give a cheap but distinctive cross-image sample.
 fn fingerprint_sample_offsets(total: u64) -> Vec<u64> {
     let page = size::kb(4) as u64;
     let mut offsets = vec![0];
@@ -442,6 +462,7 @@ fn default_cache_dir() -> Option<PathBuf> {
     }
 }
 
+/// Minimal FNV-1a 64-bit hasher used for cache fingerprints.
 struct Fnv64(u64);
 
 impl Fnv64 {

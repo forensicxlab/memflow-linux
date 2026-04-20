@@ -320,6 +320,8 @@ impl LinuxDefs {
         Self::from_raw(parsed.raw, parsed.banner)
     }
 
+    /// Converts a [`RawProfile`] (from either BTF or DWARF) into a serializable
+    /// [`LinuxDefs`] document by resolving all required field offsets and symbols.
     fn from_raw(raw: RawProfile, fallback_banner: Vec<u8>) -> Result<Self> {
         let text = raw.required_symbol_address("_text")?;
         let init_task = raw.required_symbol_address("init_task")?;
@@ -527,6 +529,7 @@ fn default_format_version() -> u32 {
     LINUX_DEFS_FORMAT_VERSION
 }
 
+/// Returns a zeroed `MapleOffsets` for pre-6.1 kernels that use a linked-list VMA layout.
 fn zero_maple_offsets() -> MapleOffsets {
     MapleOffsets {
         tree: MapleTreeOffsets { ma_root: 0 },
@@ -939,36 +942,46 @@ mod tests {
     }
 }
 
+/// Intermediate representation of symbols, struct types, and enums extracted from
+/// a `vmlinux` image before they are normalized into the final [`LinuxDefs`] document.
 pub(crate) struct RawProfile {
     pub(crate) symbols: HashMap<String, Option<RawSymbol>>,
     pub(crate) user_types: HashMap<String, RawUserType>,
     pub(crate) enums: HashMap<String, RawEnum>,
 }
 
+/// A single symbol extracted from the `vmlinux` ELF, optionally carrying inline
+/// constant data (used for `linux_banner`).
 #[derive(Clone)]
 pub(crate) struct RawSymbol {
     pub(crate) address: AddressValue,
     pub(crate) constant_data: Option<Vec<u8>>,
 }
 
+/// Normalized struct or union type with its total byte size and named fields.
 #[derive(Clone)]
 pub(crate) struct RawUserType {
     pub(crate) size: usize,
     pub(crate) fields: HashMap<String, RawField>,
 }
 
+/// Normalized enum type mapping constant names to their signed integer values.
 #[derive(Clone)]
 pub(crate) struct RawEnum {
     pub(crate) constants: HashMap<String, i64>,
 }
 
+/// A single field within a [`RawUserType`], recording its byte offset, whether it
+/// originates from an anonymous embedded struct/union, and the field's type.
 #[derive(Clone)]
 pub(crate) struct RawField {
     pub(crate) offset: usize,
+    /// `true` when this field has no name in the source (anonymous nested composite).
     pub(crate) anonymous: bool,
     pub(crate) ty: RawTypeRef,
 }
 
+/// Normalized type descriptor used during profile extraction.
 #[derive(Clone)]
 pub(crate) enum RawTypeRef {
     Base {
@@ -1019,6 +1032,8 @@ impl RawTypeRef {
     }
 }
 
+/// Resolved byte offset and type for a field, after recursing through anonymous
+/// nested structs/unions.
 #[derive(Clone)]
 struct ResolvedField {
     offset: usize,
@@ -1082,6 +1097,8 @@ impl RawProfile {
         self.resolve_field_inner(type_name, field_name, 0, 0)
     }
 
+    /// Recursively resolves a named field through anonymous nested composites.
+    /// `base_offset` accumulates the byte displacement from the outermost struct root.
     fn resolve_field_inner(
         &self,
         type_name: &str,
@@ -1119,6 +1136,7 @@ impl RawProfile {
     }
 }
 
+/// A newtype around a raw `u64` virtual address stored in a [`RawSymbol`].
 #[derive(Clone, Copy)]
 pub(crate) struct AddressValue(pub(crate) u64);
 
