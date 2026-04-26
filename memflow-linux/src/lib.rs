@@ -6,6 +6,8 @@
 mod cache;
 /// Runtime representation of generated Linux definitions.
 pub mod defs;
+/// Defs-free kernel-version discovery via physical-memory scanning.
+pub mod discover;
 /// Helpers for decoding and iterating the live kernel `kallsyms` tables.
 pub mod kallsyms;
 /// Linux kernel bootstrap, discovery, and `Os` implementation.
@@ -28,6 +30,7 @@ pub use defs::{
     ModuleStateValues, MountOffsets, PathOffsets, QstrOffsets, TaskStructOffsets, VfsMountOffsets,
     VmAreaStructOffsets,
 };
+pub use discover::{discover_kernel_versions, KernelVersionInfo};
 pub use kernel::{linux_arch, LinuxKernel, LinuxKernelBuilder, LinuxKernelInfo};
 pub use process::{LinuxProcess, LinuxProcessInfo};
 pub use profile::{LinuxProfile, LinuxSymbols};
